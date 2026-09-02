@@ -66,6 +66,12 @@ struct io_stats_per_prio {
 	atomic_t completed;
 };
 
+/* ZNS multi-inflight state per zone. */
+struct dd_zns_zone_state {
+	unsigned int inflight;
+	bool disabled;
+};
+
 /*
  * Deadline scheduler data per I/O priority (enum dd_prio). Requests are
  * present on both sort_list[] and fifo_list[].
@@ -91,6 +97,11 @@ struct deadline_data {
 	unsigned int batching;		/* number of sequential requests made */
 	unsigned int starved;		/* times reads have starved writes */
 
+	/* ZNS multi inflight, protected by zone_lock */
+	bool zns_multi_inflight_enabled;
+	unsigned int zns_nr_zones;
+	struct dd_zns_zone_state *zns_zones;
+
 	/*
 	 * settings that change how the i/o scheduler behaves
 	 */
@@ -104,6 +115,9 @@ struct deadline_data {
 	spinlock_t lock;
 	spinlock_t zone_lock;
 };
+
+/* rq->elv.priv[1] marker for a write dispatched multi inflight */
+#define DD_ZNS_MULTI_INFLIGHT	((void *)(uintptr_t)1)
 
 /* Maps an I/O priority class to a deadline scheduler priority. */
 static const enum dd_prio ioprio_class_to_prio[] = {
@@ -126,6 +140,102 @@ deadline_rb_root(struct dd_per_prio *per_prio, struct request *rq)
 static u8 dd_rq_ioclass(struct request *rq)
 {
 	return IOPRIO_PRIO_CLASS(req_get_ioprio(rq));
+}
+
+static struct dd_zns_zone_state *
+dd_zns_get_zone(struct deadline_data *dd, struct request *rq)
+{
+	unsigned int zno = disk_zone_no(rq->q->disk, blk_rq_pos(rq));
+
+	if (dd->zns_zones && zno < dd->zns_nr_zones)
+		return &dd->zns_zones[zno];
+	return NULL;
+}
+
+static bool dd_zns_multi_inflight_candidate(struct deadline_data *dd,
+					    struct request *rq)
+{
+	return READ_ONCE(dd->zns_multi_inflight_enabled) &&
+	       req_op(rq) == REQ_OP_WRITE && blk_req_needs_zone_write_lock(rq);
+}
+
+/* Own-hctx gate */
+static bool dd_zns_multi_inflight_ok(struct request *rq,
+				     struct blk_mq_hw_ctx *call_hctx)
+{
+	return !blk_req_zone_is_write_locked(rq) &&
+	       (!call_hctx || rq->mq_hctx == call_hctx);
+}
+
+static bool dd_zns_can_dispatch(struct deadline_data *dd, struct request *rq,
+				bool allow_multi_inflight,
+				struct blk_mq_hw_ctx *call_hctx)
+{
+	struct dd_zns_zone_state *zs;
+
+	if (!blk_req_needs_zone_write_lock(rq))
+		return true;
+
+	zs = dd_zns_get_zone(dd, rq);
+	if (!zs)
+		return blk_req_can_dispatch_to_zone(rq);
+
+	if (allow_multi_inflight && !zs->disabled &&
+	    dd_zns_multi_inflight_candidate(dd, rq))
+		return dd_zns_multi_inflight_ok(rq, call_hctx);
+
+	return !zs->inflight && blk_req_can_dispatch_to_zone(rq);
+}
+
+static void dd_zns_start_request(struct deadline_data *dd, struct request *rq,
+				 bool allow_multi_inflight,
+				 struct blk_mq_hw_ctx *call_hctx)
+{
+	struct dd_zns_zone_state *zs;
+	unsigned long flags;
+
+	if (!blk_queue_is_zoned(rq->q))
+		return;
+
+	spin_lock_irqsave(&dd->zone_lock, flags);
+	zs = dd_zns_get_zone(dd, rq);
+
+	if (allow_multi_inflight && zs && !zs->disabled &&
+	    dd_zns_multi_inflight_candidate(dd, rq) &&
+	    dd_zns_multi_inflight_ok(rq, call_hctx)) {
+		zs->inflight++;
+		
+		rq->elv.priv[1] = DD_ZNS_MULTI_INFLIGHT;
+		rq->rq_flags |= RQF_ZNS_ORDERED;
+
+	} else {
+		blk_req_zone_write_lock(rq);
+	}
+	spin_unlock_irqrestore(&dd->zone_lock, flags);
+}
+
+static void dd_zns_finish_request(struct deadline_data *dd, struct request *rq,
+				  bool requeued)
+{
+	struct dd_zns_zone_state *zs;
+	unsigned long flags;
+
+	if (rq->elv.priv[1] != DD_ZNS_MULTI_INFLIGHT &&
+	    !(rq->rq_flags & RQF_ZONE_WRITE_LOCKED))
+		return;
+
+	spin_lock_irqsave(&dd->zone_lock, flags);
+	if (rq->elv.priv[1] == DD_ZNS_MULTI_INFLIGHT) {
+		zs = dd_zns_get_zone(dd, rq);
+		if (zs && zs->inflight)
+			zs->inflight--;
+		if (zs && requeued)
+			zs->disabled = true;
+		rq->elv.priv[1] = NULL;
+		rq->rq_flags &= ~RQF_ZNS_ORDERED;
+	}
+	blk_req_zone_write_unlock(rq);
+	spin_unlock_irqrestore(&dd->zone_lock, flags);
 }
 
 /*
@@ -344,7 +454,8 @@ static struct request *deadline_skip_seq_writes(struct deadline_data *dd,
  */
 static struct request *
 deadline_fifo_request(struct deadline_data *dd, struct dd_per_prio *per_prio,
-		      enum dd_data_dir data_dir)
+		      enum dd_data_dir data_dir,
+		      struct blk_mq_hw_ctx *call_hctx)
 {
 	struct request *rq, *rb_rq, *next;
 	unsigned long flags;
@@ -370,7 +481,7 @@ deadline_fifo_request(struct deadline_data *dd, struct dd_per_prio *per_prio,
 		rb_rq = deadline_from_pos(per_prio, data_dir, blk_rq_pos(rq));
 		if (rb_rq && blk_rq_pos(rb_rq) < blk_rq_pos(rq))
 			rq = rb_rq;
-		if (blk_req_can_dispatch_to_zone(rq) &&
+		if (dd_zns_can_dispatch(dd, rq, true, call_hctx) &&
 		    (blk_queue_nonrot(rq->q) ||
 		     !deadline_is_seq_write(dd, rq)))
 			goto out;
@@ -388,7 +499,8 @@ out:
  */
 static struct request *
 deadline_next_request(struct deadline_data *dd, struct dd_per_prio *per_prio,
-		      enum dd_data_dir data_dir)
+		      enum dd_data_dir data_dir,
+		      struct blk_mq_hw_ctx *call_hctx)
 {
 	struct request *rq;
 	unsigned long flags;
@@ -410,7 +522,7 @@ deadline_next_request(struct deadline_data *dd, struct dd_per_prio *per_prio,
 	 */
 	spin_lock_irqsave(&dd->zone_lock, flags);
 	while (rq) {
-		if (blk_req_can_dispatch_to_zone(rq))
+		if (dd_zns_can_dispatch(dd, rq, true, call_hctx))
 			break;
 		if (blk_queue_nonrot(rq->q))
 			rq = deadline_latter_request(rq);
@@ -442,19 +554,30 @@ static bool started_after(struct deadline_data *dd, struct request *rq,
  */
 static struct request *__dd_dispatch_request(struct deadline_data *dd,
 					     struct dd_per_prio *per_prio,
-					     unsigned long latest_start)
+					     unsigned long latest_start,
+					     struct blk_mq_hw_ctx *call_hctx)
 {
 	struct request *rq, *next_rq;
 	enum dd_data_dir data_dir;
 	enum dd_prio prio;
 	u8 ioprio_class;
+	bool allow_multi_inflight = false;
 
 	lockdep_assert_held(&dd->lock);
 
 	if (!list_empty(&per_prio->dispatch)) {
+		unsigned long flags;
+		bool can_dispatch;
+
 		rq = list_first_entry(&per_prio->dispatch, struct request,
 				      queuelist);
 		if (started_after(dd, rq, latest_start))
+			return NULL;
+		/* Requeued writes wait for the zone to drain. */
+		spin_lock_irqsave(&dd->zone_lock, flags);
+		can_dispatch = dd_zns_can_dispatch(dd, rq, false, NULL);
+		spin_unlock_irqrestore(&dd->zone_lock, flags);
+		if (!can_dispatch)
 			return NULL;
 		list_del_init(&rq->queuelist);
 		data_dir = rq_data_dir(rq);
@@ -464,7 +587,7 @@ static struct request *__dd_dispatch_request(struct deadline_data *dd,
 	/*
 	 * batches are currently reads XOR writes
 	 */
-	rq = deadline_next_request(dd, per_prio, dd->last_dir);
+	rq = deadline_next_request(dd, per_prio, dd->last_dir, call_hctx);
 	if (rq && dd->batching < dd->fifo_batch) {
 		/* we have a next request and are still entitled to batch */
 		data_dir = rq_data_dir(rq);
@@ -479,7 +602,7 @@ static struct request *__dd_dispatch_request(struct deadline_data *dd,
 	if (!list_empty(&per_prio->fifo_list[DD_READ])) {
 		BUG_ON(RB_EMPTY_ROOT(&per_prio->sort_list[DD_READ]));
 
-		if (deadline_fifo_request(dd, per_prio, DD_WRITE) &&
+		if (deadline_fifo_request(dd, per_prio, DD_WRITE, call_hctx) &&
 		    (dd->starved++ >= dd->writes_starved))
 			goto dispatch_writes;
 
@@ -509,14 +632,14 @@ dispatch_find_request:
 	/*
 	 * we are not running a batch, find best request for selected data_dir
 	 */
-	next_rq = deadline_next_request(dd, per_prio, data_dir);
+	next_rq = deadline_next_request(dd, per_prio, data_dir, call_hctx);
 	if (deadline_check_fifo(per_prio, data_dir) || !next_rq) {
 		/*
 		 * A deadline has expired, the last request was in the other
 		 * direction, or we have run out of higher-sectored requests.
 		 * Start again from the request with the earliest expiry time.
 		 */
-		rq = deadline_fifo_request(dd, per_prio, data_dir);
+		rq = deadline_fifo_request(dd, per_prio, data_dir, call_hctx);
 	} else {
 		/*
 		 * The last req was the same dir and we have a next request in
@@ -544,15 +667,13 @@ dispatch_request:
 	 */
 	dd->batching++;
 	deadline_move_request(dd, per_prio, rq);
+	allow_multi_inflight = true;
 done:
 	ioprio_class = dd_rq_ioclass(rq);
 	prio = ioprio_class_to_prio[ioprio_class];
 	dd->per_prio[prio].latest_pos[data_dir] = blk_rq_pos(rq);
 	dd->per_prio[prio].stats.dispatched++;
-	/*
-	 * If the request needs its target zone locked, do it.
-	 */
-	blk_req_zone_write_lock(rq);
+	dd_zns_start_request(dd, rq, allow_multi_inflight, call_hctx);
 	rq->rq_flags |= RQF_STARTED;
 	return rq;
 }
@@ -562,7 +683,8 @@ done:
  * that were inserted more than prio_aging_expire jiffies ago.
  */
 static struct request *dd_dispatch_prio_aged_requests(struct deadline_data *dd,
-						      unsigned long now)
+						      unsigned long now,
+						      struct blk_mq_hw_ctx *hctx)
 {
 	struct request *rq;
 	enum dd_prio prio;
@@ -577,7 +699,7 @@ static struct request *dd_dispatch_prio_aged_requests(struct deadline_data *dd,
 
 	for (prio = DD_BE_PRIO; prio <= DD_PRIO_MAX; prio++) {
 		rq = __dd_dispatch_request(dd, &dd->per_prio[prio],
-					   now - dd->prio_aging_expire);
+					   now - dd->prio_aging_expire, hctx);
 		if (rq)
 			return rq;
 	}
@@ -601,7 +723,7 @@ static struct request *dd_dispatch_request(struct blk_mq_hw_ctx *hctx)
 	enum dd_prio prio;
 
 	spin_lock(&dd->lock);
-	rq = dd_dispatch_prio_aged_requests(dd, now);
+	rq = dd_dispatch_prio_aged_requests(dd, now, hctx);
 	if (rq)
 		goto unlock;
 
@@ -610,7 +732,7 @@ static struct request *dd_dispatch_request(struct blk_mq_hw_ctx *hctx)
 	 * requests if any higher priority requests are pending.
 	 */
 	for (prio = 0; prio <= DD_PRIO_MAX; prio++) {
-		rq = __dd_dispatch_request(dd, &dd->per_prio[prio], now);
+		rq = __dd_dispatch_request(dd, &dd->per_prio[prio], now, hctx);
 		if (rq || dd_queued(dd, prio))
 			break;
 	}
@@ -682,6 +804,7 @@ static void dd_exit_sched(struct elevator_queue *e)
 			  stats->dispatched, atomic_read(&stats->completed));
 	}
 
+	kfree(dd->zns_zones);
 	kfree(dd);
 }
 
@@ -723,6 +846,11 @@ static int dd_init_sched(struct request_queue *q, struct elevator_type *e)
 	dd->prio_aging_expire = prio_aging_expire;
 	spin_lock_init(&dd->lock);
 	spin_lock_init(&dd->zone_lock);
+
+	dd->zns_nr_zones = q->disk ? disk_nr_zones(q->disk) : 0;
+	if (dd->zns_nr_zones)
+		dd->zns_zones = kcalloc(dd->zns_nr_zones,
+					sizeof(*dd->zns_zones), GFP_KERNEL);
 
 	/* We dispatch from request queue wide instead of hw queue */
 	blk_queue_flag_set(QUEUE_FLAG_SQ_SCHED, q);
@@ -808,7 +936,7 @@ static void dd_insert_request(struct blk_mq_hw_ctx *hctx, struct request *rq,
 	 * This may be a requeue of a write request that has locked its
 	 * target zone. If it is the case, this releases the zone lock.
 	 */
-	blk_req_zone_write_unlock(rq);
+	dd_zns_finish_request(dd, rq, true);
 
 	prio = ioprio_class_to_prio[ioprio_class];
 	per_prio = &dd->per_prio[prio];
@@ -885,6 +1013,7 @@ static void dd_insert_requests(struct blk_mq_hw_ctx *hctx,
 static void dd_prepare_request(struct request *rq)
 {
 	rq->elv.priv[0] = NULL;
+	rq->elv.priv[1] = NULL;
 }
 
 static bool dd_has_write_work(struct blk_mq_hw_ctx *hctx)
@@ -934,11 +1063,7 @@ static void dd_finish_request(struct request *rq)
 	atomic_inc(&per_prio->stats.completed);
 
 	if (blk_queue_is_zoned(q)) {
-		unsigned long flags;
-
-		spin_lock_irqsave(&dd->zone_lock, flags);
-		blk_req_zone_write_unlock(rq);
-		spin_unlock_irqrestore(&dd->zone_lock, flags);
+		dd_zns_finish_request(dd, rq, false);
 
 		if (dd_has_write_work(rq->mq_hctx))
 			blk_mq_sched_mark_restart_hctx(rq->mq_hctx);
@@ -982,6 +1107,7 @@ SHOW_INT(deadline_writes_starved_show, dd->writes_starved);
 SHOW_INT(deadline_front_merges_show, dd->front_merges);
 SHOW_INT(deadline_async_depth_show, dd->async_depth);
 SHOW_INT(deadline_fifo_batch_show, dd->fifo_batch);
+SHOW_INT(deadline_zns_multi_inflight_show, dd->zns_multi_inflight_enabled);
 #undef SHOW_INT
 #undef SHOW_JIFFIES
 
@@ -1016,6 +1142,23 @@ STORE_INT(deadline_fifo_batch_store, &dd->fifo_batch, 0, INT_MAX);
 #undef STORE_INT
 #undef STORE_JIFFIES
 
+static ssize_t deadline_zns_multi_inflight_store(struct elevator_queue *e,
+						 const char *page, size_t count)
+{
+	struct deadline_data *dd = e->elevator_data;
+	bool enable;
+	int ret;
+
+	ret = kstrtobool(page, &enable);
+	if (ret)
+		return ret;
+	if (enable && !dd->zns_zones)
+		return -EINVAL;
+
+	WRITE_ONCE(dd->zns_multi_inflight_enabled, enable);
+	return count;
+}
+
 #define DD_ATTR(name) \
 	__ATTR(name, 0644, deadline_##name##_show, deadline_##name##_store)
 
@@ -1027,6 +1170,7 @@ static struct elv_fs_entry deadline_attrs[] = {
 	DD_ATTR(async_depth),
 	DD_ATTR(fifo_batch),
 	DD_ATTR(prio_aging_expire),
+	DD_ATTR(zns_multi_inflight),
 	__ATTR_NULL
 };
 

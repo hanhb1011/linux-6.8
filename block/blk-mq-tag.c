@@ -188,9 +188,13 @@ unsigned int blk_mq_get_tag(struct blk_mq_alloc_data *data)
 
 		sbitmap_finish_wait(bt, ws, &wait);
 
-		data->ctx = blk_mq_get_ctx(data->q);
-		data->hctx = blk_mq_map_queue(data->q, data->cmd_flags,
-						data->ctx);
+		/* Keep a ZNS per-zone forced hctx across the tag wait. */
+		if (!blk_mq_zns_apply_per_zone_mapping(data)) {
+			data->ctx = blk_mq_get_ctx(data->q);
+			data->hctx = blk_mq_map_queue(data->q,
+						      data->cmd_flags,
+						      data->ctx);
+		}
 		tags = blk_mq_tags_from_data(data);
 		if (data->flags & BLK_MQ_REQ_RESERVED)
 			bt = &tags->breserved_tags;

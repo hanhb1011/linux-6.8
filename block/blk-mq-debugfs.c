@@ -258,6 +258,7 @@ static const char *const rqf_name[] = {
 	RQF_NAME(SPECIAL_PAYLOAD),
 	RQF_NAME(ZONE_WRITE_LOCKED),
 	RQF_NAME(TIMED_OUT),
+	RQF_NAME(ZNS_ORDERED),
 	RQF_NAME(RESV),
 };
 #undef RQF_NAME

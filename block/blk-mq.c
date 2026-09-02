@@ -44,6 +44,9 @@
 static DEFINE_PER_CPU(struct llist_head, blk_cpu_done);
 static DEFINE_PER_CPU(call_single_data_t, blk_cpu_csd);
 
+static bool zns_per_zone_mapping;
+module_param(zns_per_zone_mapping, bool, 0644);
+
 static void blk_mq_insert_request(struct request *rq, blk_insert_t flags);
 static void blk_mq_request_bypass_insert(struct request *rq,
 		blk_insert_t flags);
@@ -434,6 +437,57 @@ __blk_mq_alloc_requests_batch(struct blk_mq_alloc_data *data)
 	return rq_list_pop(data->cached_rq);
 }
 
+/*
+ * ZNS per-zone hctx mapping: regular writes to the same sequential zone are
+ * allocated on the same HCTX_TYPE_DEFAULT hctx (zone number modulo the number
+ * of default hctxs). Decided before allocation; rq->mq_hctx never changes.
+ */
+static void blk_mq_zns_per_zone_mapping_init(struct blk_mq_alloc_data *data,
+					     struct bio *bio)
+{
+	struct request_queue *q = data->q;
+	struct blk_mq_queue_map *map = &q->tag_set->map[HCTX_TYPE_DEFAULT];
+	unsigned int hctx_idx;
+
+	if (!zns_per_zone_mapping || !blk_queue_is_zoned(q) ||
+	    bio_op(bio) != REQ_OP_WRITE || !map->nr_queues || !q->elevator ||
+	    strcmp(q->elevator->type->elevator_name, "mq-deadline"))
+		return;
+
+	hctx_idx = map->queue_offset + bio_zone_no(bio) % map->nr_queues;
+	if (hctx_idx >= q->nr_hw_queues)
+		return;
+
+	data->zns_per_zone_mapping_candidate = true;
+	data->zns_per_zone_mapping_hctx_idx = hctx_idx;
+}
+
+/* Returns false if the forced hctx is unusable; caller then maps by CPU. */
+bool blk_mq_zns_apply_per_zone_mapping(struct blk_mq_alloc_data *data)
+{
+	struct request_queue *q = data->q;
+	struct blk_mq_hw_ctx *hctx;
+	unsigned int cpu;
+
+	if (!data->zns_per_zone_mapping_candidate)
+		return false;
+
+	hctx = xa_load(&q->hctx_table, data->zns_per_zone_mapping_hctx_idx);
+	if (!hctx || !blk_mq_hw_queue_mapped(hctx))
+		return false;
+
+	cpu = cpumask_first_and(hctx->cpumask, cpu_online_mask);
+	if (cpu >= nr_cpu_ids)
+		return false;
+
+	data->ctx = __blk_mq_get_ctx(q, cpu);
+	if (data->ctx->hctxs[HCTX_TYPE_DEFAULT] != hctx)
+		return false;
+
+	data->hctx = hctx;
+	return true;
+}
+
 static struct request *__blk_mq_alloc_requests(struct blk_mq_alloc_data *data)
 {
 	struct request_queue *q = data->q;
@@ -472,8 +526,10 @@ static struct request *__blk_mq_alloc_requests(struct blk_mq_alloc_data *data)
 	}
 
 retry:
-	data->ctx = blk_mq_get_ctx(q);
-	data->hctx = blk_mq_map_queue(q, data->cmd_flags, data->ctx);
+	if (!blk_mq_zns_apply_per_zone_mapping(data)) {
+		data->ctx = blk_mq_get_ctx(q);
+		data->hctx = blk_mq_map_queue(q, data->cmd_flags, data->ctx);
+	}
 	if (!(data->rq_flags & RQF_SCHED_TAGS))
 		blk_mq_tag_busy(data->hctx);
 
@@ -2900,6 +2956,7 @@ static struct request *blk_mq_get_new_requests(struct request_queue *q,
 		plug->nr_ios = 1;
 		data.cached_rq = &plug->cached_rq;
 	}
+	blk_mq_zns_per_zone_mapping_init(&data, bio);
 
 	rq = __blk_mq_alloc_requests(&data);
 	if (rq)

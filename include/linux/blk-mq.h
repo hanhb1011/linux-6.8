@@ -57,6 +57,8 @@ typedef __u32 __bitwise req_flags_t;
 #define RQF_ZONE_WRITE_LOCKED	((__force req_flags_t)(1 << 19))
 /* ->timeout has been called, don't expire again */
 #define RQF_TIMED_OUT		((__force req_flags_t)(1 << 21))
+/* zoned multi-inflight write: issue with device-side ordered semantics */
+#define RQF_ZNS_ORDERED		((__force req_flags_t)(1 << 22))
 #define RQF_RESV		((__force req_flags_t)(1 << 23))
 
 /* flags that prevent us from merging requests: */

@@ -113,6 +113,9 @@ static bool is_mcq_supported(struct ufs_hba *hba)
 module_param(use_mcq_mode, bool, 0644);
 MODULE_PARM_DESC(use_mcq_mode, "Control MCQ mode for controllers starting from UFSHCI 4.0. 1 - enable MCQ, 0 - disable MCQ. MCQ is enabled by default");
 
+static bool zns_ordered_task;
+module_param(zns_ordered_task, bool, 0644);
+
 #define ufshcd_toggle_vreg(_dev, _vreg, _on)				\
 	({                                                              \
 		int _ret;                                               \
@@ -2846,6 +2849,8 @@ static void ufshcd_comp_scsi_upiu(struct ufs_hba *hba, struct ufshcd_lrb *lrbp)
 				    lrbp->cmd->sc_data_direction, 0);
 	if (ioprio_class == IOPRIO_CLASS_RT)
 		upiu_flags |= UPIU_CMD_FLAGS_CP;
+	if (zns_ordered_task && (rq->rq_flags & RQF_ZNS_ORDERED))
+		upiu_flags |= UPIU_TASK_ATTR_ORDERED;
 	ufshcd_prepare_utp_scsi_cmd_upiu(lrbp, upiu_flags);
 }
 

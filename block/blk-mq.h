@@ -155,10 +155,16 @@ struct blk_mq_alloc_data {
 	unsigned int nr_tags;
 	struct request **cached_rq;
 
+	/* ZNS per-zone hctx mapping: allocate on this hctx instead */
+	bool zns_per_zone_mapping_candidate;
+	unsigned int zns_per_zone_mapping_hctx_idx;
+
 	/* input & output parameter */
 	struct blk_mq_ctx *ctx;
 	struct blk_mq_hw_ctx *hctx;
 };
+
+bool blk_mq_zns_apply_per_zone_mapping(struct blk_mq_alloc_data *data);
 
 struct blk_mq_tags *blk_mq_init_tags(unsigned int nr_tags,
 		unsigned int reserved_tags, int node, int alloc_policy);
