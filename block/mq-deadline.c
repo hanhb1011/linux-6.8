@@ -950,7 +950,10 @@ static void dd_insert_request(struct blk_mq_hw_ctx *hctx, struct request *rq,
 
 	trace_block_rq_insert(rq);
 
-	if (flags & BLK_MQ_INSERT_AT_HEAD) {
+	/* Multi-inflight: requeued zoned writes go back in LBA order. */
+	if ((flags & BLK_MQ_INSERT_AT_HEAD) &&
+	    !(READ_ONCE(dd->zns_multi_inflight_enabled) &&
+	      blk_rq_is_seq_zoned_write(rq))) {
 		list_add(&rq->queuelist, &per_prio->dispatch);
 		rq->fifo_time = jiffies;
 	} else {
